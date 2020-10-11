@@ -38,8 +38,10 @@
  * HISTORY
  *	07/2001 Ported by Wayne Boyer
  */
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <errno.h>
 #include <unistd.h>
@@ -61,12 +63,36 @@ static size_t page_sz;
 static char *addr;
 static char *dummy;
 static int fildes;
-static volatile int pass = 0;
 static sigjmp_buf env;
 
 static void setup(void);
 static void cleanup(void);
 static void sig_handler(int sig);
+
+static bool pkey_supported(void)
+{
+#ifdef __NR_pkey_mprotect
+	/* `man` doesn't specify any way how to check for PKEY presence
+	 * support, we need to fall back to this hack.
+	 */
+	int ret = syscall(__NR_pkey_mprotect, /*addr=*/(void*)1, 1, 0, 0);
+	if (ret == 0) {
+		/* pkey_mprotect should always fail when called with an
+		 * unaligned address */
+		tst_brkm(TFAIL, cleanup, "mmap() succeeded unexpectedly");
+	}
+	return errno != ENOSYS;
+#else
+	return false;
+#endif
+}
+
+#if defined(__ia64__) || defined(__hppa__)
+const static bool native_xom = true;
+#else
+const static bool native_xom = false;
+#endif
+
 
 int main(int ac, char **av)
 {
@@ -108,30 +134,42 @@ int main(int ac, char **av)
 		 * Check whether the mapped memory region
 		 * has the file contents.
 		 *
-		 * with ia64 and PARISC/hppa, this should
-		 * generate a SIGSEGV which will be caught below.
+		 * with ia64, PARISC/hppa and x86 with PKEYs support this
+		 * should generate a SIGSEGV which will be caught below.
 		 *
 		 */
 
-		if (sigsetjmp(env, 1) == 0) {
-			if (memcmp(dummy, addr, page_sz)) {
-				tst_resm(TFAIL,
-					 "mapped memory region "
-					 "contains invalid data");
+		bool sigsegv_received = false;
+		bool cmp_successful = false;
+		if (sigsetjmp(env, 1) == 0 && !memcmp(dummy, addr, page_sz)) {
+			cmp_successful = true;
+		} else {
+			sigsegv_received = true;
+		}
+
+
+		if (native_xom || pkey_supported()) {
+			/* eXecute-Only Memory should be supported on this
+			 * platform */
+			if (sigsegv_received) {
+				tst_resm(TPASS, "Got SIGSEGV as expected");
 			} else {
+				tst_resm(TFAIL,
+				         "Mapped memory region with no read access is accessible");
+			}
+		} else {
+			/* eXecute-Only Memory is not supported on this
+			 * platform */
+			if (cmp_successful) {
 				tst_resm(TPASS,
-					 "mmap() functionality is "
-					 "correct");
+					 "mmap() functionality is correct");
+			} else {
+				tst_resm(TFAIL,
+					 sigsegv_received
+					 ? "Got unexpected SIGSEGV"
+					 : "Mapped memory region contains invalid data");
 			}
 		}
-#if defined(__ia64__) || defined(__hppa__)
-		if (pass) {
-			tst_resm(TPASS, "Got SIGSEGV as expected");
-		} else {
-			tst_resm(TFAIL, "Mapped memory region with NO "
-				 "access is accessible");
-		}
-#endif
 
 		/* Clean up things in case we are looping */
 		/* Unmap the mapped memory */
@@ -139,8 +177,6 @@ int main(int ac, char **av)
 			tst_brkm(TFAIL | TERRNO, cleanup,
 				 "failed to unmap the mmapped pages");
 		}
-		pass = 0;
-
 	}
 
 	cleanup();
@@ -215,11 +251,11 @@ static void setup(void)
 static void sig_handler(int sig)
 {
 	if (sig == SIGSEGV) {
-		/* set the global variable and jump back */
-		pass = 1;
+		/* jump back */
 		siglongjmp(env, 1);
-	} else
+	} else {
 		tst_brkm(TBROK, cleanup, "received an unexpected signal");
+	}
 }
 
 static void cleanup(void)
